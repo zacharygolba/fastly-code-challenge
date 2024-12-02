@@ -1,0 +1,9 @@
+[package]
+name = "blob"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+js-sys = "0.3.74"
+regex = "1.11.1"
+web-sys = "0.3.74"
