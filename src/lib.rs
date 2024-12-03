@@ -31,60 +31,64 @@ pub enum LineEndings {
 }
 
 fn normalize_line_endings(input: &str) -> Cow<str> {
-    // We use this store the end offset of the last char that was read into
-    // buffer.
-    let mut n_read = 0;
+    // The end offset of the last char that was read into the output buffer.
+    let mut offset = 0;
 
-    // Prefer a single allocation over the possbility of 0 or n allocations.
-    // This will be slightly slower for strings that do not require line ending
-    // normalization but is likely on average, better than conditionally
-    // allocating in a loop.
-    let mut output = String::with_capacity(input.len());
-
-    // On windows, we conditionally prepend an `\r` before any occurance of
-    // a `\n`. This maintains compatibility with protocols that use `\r` as a
-    // control char (such as SMTP).
+    // An iterator over the byte position of every occurance of `\n` in input.
     #[cfg(target_os = "windows")]
-    let endings = input.match_indices("\n");
+    let mut indices = input.match_indices("\n").peekable();
 
-    // On all other platforms, we simply replace `\r\n` with `\n`.
+    // An iterator over the byte position of every occurance of `\r\n` in input.
     #[cfg(not(target_os = "windows"))]
-    let endings = input.match_indices("\r\n");
+    let mut indices = input.match_indices("\r\n").peekable();
 
-    for (start, pat) in endings {
-        let prefix = &input[n_read..start];
+    // Conditionally preallocate an owned string to use as an output buffer.
+    let mut normalized = match indices.peek() {
+        // The input string requires line ending normalization. Preallocate a
+        // string with as much capacity as the input.
+        Some(_) => String::with_capacity(input.len()),
+
+        // The input string does not require line ending normalization. Return
+        // early.
+        None => return Cow::Borrowed(input),
+    };
+
+    for (start, le) in &mut indices {
+        // A slice of the input string from the index of the last char that was
+        // read into the normalized output buffer to the start of the line
+        // ending that requires substitution.
+        let slice = &input[offset..start];
 
         // Append the slice to buffer from text. Starting from the end offset
         // of the previous line ending that we replaced to the start of the
         // line ending that we're currently replacing.
-        output.push_str(prefix);
+        normalized.push_str(slice);
 
+        // On windows, conditionally prepend an `\r` before any occurance of a
+        // `\n`. This maintains compatibility with protocols that use `\r` as
+        // a control char (such as SMTP).
         #[cfg(target_os = "windows")]
-        if !prefix.ends_with('\r') {
-            output.push('\r');
+        if !slice.ends_with('\r') {
+            normalized.push('\r');
         }
 
         // Unconditionally append the `\n` char.
-        output.push('\n');
+        normalized.push('\n');
 
-        // Update the offset to include the length of prefix and the
-        // matched pattern.
-        n_read = start + pat.len();
+        // Advance the offset pointer to the start index of the char that
+        // immediately follows the line ending that was replaced.
+        offset = start + le.len();
     }
 
-    if n_read == 0 {
-        // We didn't have to replace any line endings. We can return a reference
-        // rather than an owned version of the input string.
-        return Cow::Borrowed(input);
+    // Append the remaining slice of the input to the output buffer. The bounds
+    // check is necessary in cases where the input string ends with a line ending
+    // that needed replaced.
+    if let Some(remaining) = input.get(offset..) {
+        normalized.push_str(remaining);
     }
 
-    if let Some(remaining) = input.get(n_read..) {
-        // Append the remaining suffix of input to our output buffer.
-        output.push_str(remaining);
-    }
-
-    // Return an owned version of the input data with normalized line endings.
-    Cow::Owned(output)
+    // Return an owned version of the input string with normalized line endings.
+    Cow::Owned(normalized)
 }
 
 impl Blob {
