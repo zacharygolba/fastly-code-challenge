@@ -326,6 +326,16 @@ mod tests {
     // }
 
     #[tokio::test]
+    async fn multipart() {
+        let blob = Blob::new(vec![DATA, DATA], None);
+        let mut data = DATA.to_vec();
+
+        data.extend_from_slice(DATA);
+
+        assert_eq!(blob.text().await.unwrap().as_bytes(), data);
+    }
+
+    #[tokio::test]
     async fn slice() {
         let blob = Blob::new(vec![DATA.to_vec()], None);
         let slice = blob.slice(12, Some(23), None);
