@@ -1,18 +1,12 @@
-use std::borrow::Cow;
+use js_sys::{ArrayBuffer, Uint8Array};
 use std::rc::Rc;
-use std::str::{self, Utf8Error};
+use std::string::FromUtf8Error;
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Blob {
-    data: BlobSlice,
+    data: Rc<[Vec<u8>]>,
     opts: BlobOptions,
-}
-
-#[derive(Debug, Clone)]
-pub struct BlobSlice {
-    buffer: Rc<[u8]>,
-    from: usize,
-    to: usize,
+    view: Option<(usize, usize)>,
 }
 
 #[derive(Debug, Clone)]
@@ -30,7 +24,7 @@ pub enum LineEndings {
     Transparent,
 }
 
-fn normalize_line_endings(input: &str) -> Cow<str> {
+fn normalize_line_endings(input: &str) -> Option<String> {
     // The end offset of the last char that was read into the output buffer.
     let mut offset = 0;
 
@@ -50,7 +44,7 @@ fn normalize_line_endings(input: &str) -> Cow<str> {
 
         // The input string does not require line ending normalization. Return
         // early.
-        None => return Cow::Borrowed(input),
+        None => return None,
     };
 
     for (start, le) in &mut indices {
@@ -87,18 +81,22 @@ fn normalize_line_endings(input: &str) -> Cow<str> {
         normalized.push_str(remaining);
     }
 
-    // Return an owned version of the input string with normalized line endings.
-    Cow::Owned(normalized)
+    Some(normalized)
 }
 
 impl Blob {
     /// Constructs a new Blob instance with the provided data
     ///
     #[inline]
-    pub fn new(data: Vec<u8>, opts: Option<BlobOptions>) -> Self {
+    pub fn new<I, A>(parts: I, opts: Option<BlobOptions>) -> Self
+    where
+        Vec<u8>: From<A>,
+        I: IntoIterator<Item = A>,
+    {
         Self {
-            data: data.into(),
+            data: parts.into_iter().map(Vec::from).collect(),
             opts: opts.unwrap_or_default(),
+            view: None,
         }
     }
 
@@ -109,29 +107,35 @@ impl Blob {
     /// be used instead.
     ///
     pub fn slice(&self, start: usize, end: Option<usize>, ty: Option<String>) -> Self {
-        // If `end` is `None` use `self.size()` to get the index of last byte
+        // Store the optionally Content-Type string as a Box<str> to lower the
+        // memory footprint of BlobOptions.
+        let ty = ty.map(Box::from);
+
+        // If `end` is `None` use `self.size()` to get the index of the last byte
         // that will be contained in the newly returned Blob.
         let end = end.unwrap_or_else(|| self.size());
 
-        // Convert the provided Content-Type string to a Box<str> and wrap it
-        // in a BlobOptions.
-        let opts = BlobOptions::new(LineEndings::Transparent, ty.map(Box::from));
-
-        // Get a reference to bytes that the newly returned Blob will contain.
-        // A relatively easy and future optimization that can be made to
-        // prevent duplicating data could swapping `Vec<u8>` for `Rc<[u8]>`
-        // in single-threaded environments or `Arc<[u8]>` in multi-threaded
-        // environments. For now, copying the data is the most pratical choice.
-        let data = self.data.slice(start, end);
-
-        Self { data, opts }
+        Self {
+            data: Rc::clone(&self.data),
+            opts: BlobOptions::new(LineEndings::Transparent, ty),
+            view: Some((start, end)),
+        }
     }
 
     /// The size of the underlying buffer in bytes.
     ///
     #[inline]
     pub fn size(&self) -> usize {
-        self.data.len()
+        match self.view {
+            // Get the length of the view by subtracting the end index from the
+            // start index. If overflow occurs, panic. In practice, we would want
+            // to branch on various deployment targets (i.e Node, Deno, Browsers)
+            // and throw a RangeError.
+            Some((from, to)) => to - from,
+
+            // Get the length by calculating the sum of each part.
+            None => self.data.iter().map(|part| part.len()).sum(),
+        }
     }
 
     /// Returns an optional reference to the Content-Type string of the data
@@ -147,24 +151,14 @@ impl Blob {
 
     /// An immmutable view of the underlying buffer.
     ///
-    pub fn array_buffer(&self) -> &[u8] {
-        // TODO:
-        //
-        // Use js_sys or similar to return an actual WASM compatible
-        // ArrayBuffer object.
-        self.data.as_slice()
+    pub async fn array_buffer(&self) -> ArrayBuffer {
+        self.coalesce_js().buffer()
     }
 
     /// Returns a `Future` that resolves to a byte slice.
     ///
-    pub async fn bytes(&self) -> &[u8] {
-        //
-        // TODO:
-        //
-        // Integrate with js-sys to return an actual ArrayBuffer that
-        // can be used in a browser.
-        //
-        self.data.as_slice()
+    pub async fn bytes(&self) -> Uint8Array {
+        self.coalesce_js()
     }
 
     /// Returns a `ReadableStream` that can be used in a browser.
@@ -180,50 +174,121 @@ impl Blob {
     /// If the data stored in the Blob's buffer contains an invalid UTF-8 code
     /// sequence.
     ///
-    pub async fn text(&self) -> Result<Cow<str>, Utf8Error> {
+    pub async fn text(&self) -> Result<String, FromUtf8Error> {
         // Validate that the bytes stored in self.data is valid UTF-8 sequence.
-        let text = str::from_utf8(self.data.as_slice())?;
+        let text = String::from_utf8(self.coalesce())?;
 
         if self.opts.endings == LineEndings::Native {
-            Ok(normalize_line_endings(&text))
+            Ok(normalize_line_endings(&text).unwrap_or(text))
         } else {
-            Ok(Cow::Borrowed(text))
+            Ok(text)
         }
     }
 }
 
-impl BlobSlice {
-    fn slice(&self, from: usize, to: usize) -> Self {
-        // Pardon the sloppy bounds checks.
-        assert!(from >= self.from, "start index out of bounds");
-        assert!(to <= self.to, "end index out of bounds");
-        assert!(from < to, "slice range out of bounds");
+impl Blob {
+    fn coalesce(&self) -> Vec<u8> {
+        // Calculate the length of the buffer we are creating from self.
+        let capacity = self.size();
 
-        Self {
-            buffer: Rc::clone(&self.buffer),
-            from,
-            to,
+        // If we are working with a Blob slice, use the range stored at
+        // self.view. Otherwise, use 0 for the start index and `len` for the end.
+        let (from, to) = self.view.unwrap_or((0, capacity));
+
+        // Allocate a zero-filled buffer with the total length
+        // of the view we are creating from self.
+        let mut buffer = vec![0; capacity];
+
+        // The absolute index of the byte that will be read into the output
+        // buffer.
+        let mut abs = 0;
+
+        let mut ptr = 0;
+
+        // Iterate over each part of the blob.
+        for part in self.data.iter() {
+            let len = part.len();
+            let edge = abs + len;
+
+            // Determine if the start index is stored in part.
+            if from > edge {
+                abs = edge;
+                continue;
+            }
+
+            for byte in part.iter() {
+                abs += 1;
+
+                if from >= abs {
+                    continue;
+                }
+
+                // If the offset pointer is greater than our end index, return.
+                if abs > to {
+                    return buffer;
+                }
+
+                // Set the value at ptr to byte.
+                buffer[ptr] = *byte;
+                // Increment the offset pointer.
+                ptr += 1;
+            }
         }
+
+        buffer
     }
 
-    fn as_slice(&self) -> &[u8] {
-        &self.buffer[self.from..self.to]
-    }
+    fn coalesce_js(&self) -> Uint8Array {
+        // Calculate the length of the buffer we are creating from self.
+        let len = self.size();
 
-    fn len(&self) -> usize {
-        self.to - self.from
-    }
-}
+        // If we are working with a Blob slice, use the range stored at
+        // self.view. Otherwise, use 0 for the start index and `len` for the end.
+        let (from, to) = self.view.unwrap_or((0, len));
 
-impl From<Vec<u8>> for BlobSlice {
-    fn from(buffer: Vec<u8>) -> Self {
-        let len = buffer.len();
+        // Allocate a zero-filled buffer with the total length
+        // of the view we are creating from self.
+        //
+        // TODO: determine what to do in the case of an overflow.
+        let buffer = Uint8Array::new_with_length(len as u32);
 
-        Self {
-            buffer: buffer.into(),
-            from: 0,
-            to: len,
+        // The absolute index of the byte that will be read into the output
+        // buffer.
+        let mut abs = 0;
+
+        let mut ptr = 0;
+
+        // Iterate over each part of the blob.
+        for part in self.data.iter() {
+            let edge = abs + part.len();
+
+            // Determine if the start index is stored in part.
+            if from > edge {
+                abs = edge;
+                continue;
+            }
+
+            for byte in part.iter() {
+                abs += 1;
+
+                if from >= abs {
+                    continue;
+                }
+
+                // If the offset pointer is greater than our end index, return.
+                if abs > to {
+                    return buffer;
+                }
+
+                // Set the value at ptr to byte.
+                buffer.set_index(ptr, *byte);
+
+                // Increment the offset pointer.
+                ptr += 1;
+            }
         }
+
+        buffer
     }
 }
 
@@ -247,9 +312,22 @@ mod tests {
 
     const DATA: &[u8] = b"First line\r\nSecond line\nThird line\r\nFourth line";
 
+    //
+    // TODO: figure out how to test with js-sys and setup wasm-bindgen.
+    //
+    // #[tokio::test]
+    // async fn bytes() {
+    //     let blob = Blob::new(vec![DATA.to_vec()], None);
+    //     let bytes = blob.bytes().await;
+
+    //     for (index, byte) in DATA.iter().enumerate() {
+    //         assert_eq!(bytes.get_index(index as u32), *byte);
+    //     }
+    // }
+
     #[tokio::test]
     async fn slice() {
-        let blob = Blob::new(DATA.to_vec(), None);
+        let blob = Blob::new(vec![DATA.to_vec()], None);
         let slice = blob.slice(12, Some(23), None);
 
         assert_eq!(slice.text().await.unwrap(), "Second line");
@@ -258,7 +336,7 @@ mod tests {
     #[tokio::test]
     async fn text_native() {
         let blob = Blob::new(
-            DATA.to_vec(),
+            vec![DATA.to_vec()],
             Some(BlobOptions::new(LineEndings::Native, None)),
         );
 
@@ -277,7 +355,7 @@ mod tests {
 
     #[tokio::test]
     async fn text_transparent() {
-        let blob = Blob::new(DATA.to_vec(), None);
+        let blob = Blob::new(vec![DATA.to_vec()], None);
         assert_eq!(blob.text().await.unwrap().as_bytes(), DATA);
     }
 }
