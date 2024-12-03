@@ -139,7 +139,10 @@ impl Blob {
     ///
     #[inline]
     pub fn ty(&self) -> Option<&str> {
-        self.opts.ty.as_ref().map(|ty| &**ty)
+        match &self.opts.ty {
+            Some(ty) => Some(ty),
+            None => None,
+        }
     }
 
     /// An immmutable view of the underlying buffer.
@@ -158,7 +161,7 @@ impl Blob {
         //
         // TODO:
         //
-        // Integrate with js-sys to return an actuall ArrayBuffer that
+        // Integrate with js-sys to return an actual ArrayBuffer that
         // can be used in a browser.
         //
         self.data.as_slice()
@@ -177,7 +180,7 @@ impl Blob {
     /// If the data stored in the Blob's buffer contains an invalid UTF-8 code
     /// sequence.
     ///
-    pub fn text(&self) -> Result<Cow<str>, Utf8Error> {
+    pub async fn text(&self) -> Result<Cow<str>, Utf8Error> {
         // Validate that the bytes stored in self.data is valid UTF-8 sequence.
         let text = str::from_utf8(self.data.as_slice())?;
 
@@ -192,9 +195,9 @@ impl Blob {
 impl BlobSlice {
     fn slice(&self, from: usize, to: usize) -> Self {
         // Pardon the sloppy bounds checks.
-        assert!(from < to, "index out of bounds");
         assert!(from >= self.from, "start index out of bounds");
         assert!(to <= self.to, "end index out of bounds");
+        assert!(from < to, "slice range out of bounds");
 
         Self {
             buffer: Rc::clone(&self.buffer),
@@ -244,8 +247,16 @@ mod tests {
 
     const DATA: &[u8] = b"First line\r\nSecond line\nThird line\r\nFourth line";
 
-    #[test]
-    fn line_endings() {
+    #[tokio::test]
+    async fn slice() {
+        let blob = Blob::new(DATA.to_vec(), None);
+        let slice = blob.slice(12, Some(23), None);
+
+        assert_eq!(slice.text().await.unwrap(), "Second line");
+    }
+
+    #[tokio::test]
+    async fn text_native() {
         let blob = Blob::new(
             DATA.to_vec(),
             Some(BlobOptions::new(LineEndings::Native, None)),
@@ -253,29 +264,20 @@ mod tests {
 
         #[cfg(target_os = "windows")]
         assert_eq!(
-            blob.text().unwrap(),
+            blob.text().await.unwrap(),
             "First line\r\nSecond line\r\nThird line\r\nFourth line"
         );
 
         #[cfg(not(target_os = "windows"))]
         assert_eq!(
-            blob.text().unwrap(),
+            blob.text().await.unwrap(),
             "First line\nSecond line\nThird line\nFourth line"
         );
     }
 
-    #[test]
-    fn slice() {
+    #[tokio::test]
+    async fn text_transparent() {
         let blob = Blob::new(DATA.to_vec(), None);
-        let slice = blob.slice(12, Some(23), None);
-
-        assert_eq!(slice.text().unwrap(), "Second line");
-    }
-
-    #[test]
-    fn text() {
-        let blob = Blob::new(DATA.to_vec(), None);
-
-        assert_eq!(blob.text().unwrap().as_bytes(), DATA);
+        assert_eq!(blob.text().await.unwrap().as_bytes(), DATA);
     }
 }
